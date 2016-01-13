@@ -1,4 +1,6 @@
 #include <Encoder.h>
+#include <SPI.h>
+#include <Ethernet.h>
 
 #define pinA_in 3
 #define pinB_in 2
@@ -10,11 +12,27 @@
 #define minVolume 0
 #define maxVolume 40
 
+// Rotary encoder config
 Encoder volumeKnob(pinA_in, pinB_in);
 bool currentPowerState = false;
 int currentVolume = 0;
 long knobPosition  = -999;
 
+// Ethernet server config
+byte mac[] = {
+  0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xEE
+};
+IPAddress ip(10, 0, 1, 102);
+EthernetServer server(80);
+#define BUFSIZ 100  //Buffer size for getting data
+char clientline[BUFSIZ];  //string that will contain command data
+int index = 0;  //clientline index
+String httpCommand = "";
+int requestedVolume = 0;
+
+//
+// SETUP
+//
 void setup() {
   Serial.begin(9600);
   while (!Serial) {
@@ -22,41 +40,35 @@ void setup() {
   }
   pinMode(pinA_out, OUTPUT);
   pinMode(pinB_out, OUTPUT);
-
   pinMode(led, OUTPUT);
   pinMode(powerButton, INPUT_PULLUP);
   pinMode(powerTrigger, OUTPUT);
   digitalWrite(powerTrigger, LOW);
 
+  // start the Ethernet connection and the server:
+  Ethernet.begin(mac, ip);
+  server.begin();
+  Serial.print("server is at ");
+  Serial.println(Ethernet.localIP());
+
+  resetVolume(); // reset to zero
+
   Serial.println("Ready");
 }
 
+//
+// LOOP
+//
 void loop() {
-  int sensorVal = digitalRead(powerButton);
-  if (sensorVal == HIGH) {
-    // not pressed
-  } else {
-    togglePower();
-  }  
-
-  long newPosition;
-  newPosition = volumeKnob.read();
-  if (newPosition != knobPosition && newPosition != 0) {
-    Serial.print("Position = ");
-    Serial.println(newPosition);
-    if (newPosition % 4 == 0) {
-      adjustVolume(newPosition);
-      volumeKnob.write(0);
-    }
-    knobPosition = newPosition;
-  }
-
+  hijackPowerButton();
+  hijackVolumeKnob();
+  respondToEthernet();
 }
 
-void adjustVolume(int direction) {
-//  Serial.print("direction = ");
-//  Serial.println(direction);
-  
+//
+// UTILITY FUNCTIONS
+//
+void adjustVolume(int direction) {  
   int leftPin = pinA_out;
   int rightPin = pinB_out;
 
@@ -88,7 +100,7 @@ void adjustVolume(int direction) {
     currentVolume = minVolume;
   }
   
-  printStatus();
+//  printStatus();
 }
 
 void togglePower() {
@@ -100,11 +112,136 @@ void togglePower() {
   printStatus();
 }
 
+String currentStatus() {
+  String ret = "Power: ";
+  ret += currentPowerState;
+  ret += ", Volume: ";
+  ret += currentVolume;
+  return ret;
+}
+
 void printStatus() {
-  Serial.print("Power: ");
-  Serial.print(currentPowerState);
-  Serial.print(", Volume: ");
-  Serial.println(currentVolume);
+  Serial.println(currentStatus());
   Serial.println();
+}
+
+void hijackPowerButton() {
+    int sensorVal = digitalRead(powerButton);
+  if (sensorVal == HIGH) {
+    // not pressed
+  } else {
+    togglePower();
+  }
+}
+
+void hijackVolumeKnob() {
+  long newPosition;
+  newPosition = volumeKnob.read();
+  if (newPosition != knobPosition && newPosition != 0) {
+    // Serial.print("Position = ");
+    // Serial.println(newPosition);
+    if (newPosition % 4 == 0) {
+      adjustVolume(newPosition);
+      volumeKnob.write(0);
+    }
+    knobPosition = newPosition;
+  }
+}
+
+bool setPower(bool newStatus) {
+  if ((newStatus && !currentPowerState) || (!newStatus && currentPowerState)) {
+     togglePower();
+  }
+  return currentPowerState;
+}
+
+int currentPowerStateInt() {
+  int pwrInt = (currentPowerState ? 1 : 0);
+  return pwrInt;
+}
+
+int setVolume(int newVolume) {
+  if (newVolume > maxVolume || newVolume < minVolume) {
+    return currentVolume;
+  }
+  while(newVolume != currentVolume) {
+    adjustVolume(newVolume - currentVolume);
+  }
+  return currentVolume;
+}
+
+void resetVolume() {
+  for(int i = 40; i > 0; i--) {
+    adjustVolume(-1);
+  }
+}
+
+void respondToEthernet() {
+  index = 0;  //reset the clientline index
+  EthernetClient client = server.available();
+  if (client) {
+    boolean currentLineIsBlank = true;
+    while (client.connected()) {
+      if (client.available()) {
+        char c = client.read();
+        Serial.write(c);
+        if(index<BUFSIZ)  //Only add data if the buffer isn't full.
+        {
+          clientline[index]=c;
+          index++;
+        }
+        if (c == '\n' && currentLineIsBlank)
+        {
+          client.println("HTTP/1.1 200 OK");
+          client.println("Content-Type: text/plain");
+          client.println();
+          break;
+        }
+        if (c == '\n') {
+          // you're starting a new line
+          currentLineIsBlank = true;
+        } else if (c != '\r') {
+          // you've gotten a character on the current line
+          currentLineIsBlank = false;
+        }
+        if(strstr(clientline,"/?power=on")!=0) {  //look for the command to turn the device on
+          httpCommand = "powerOn";
+        } else if(strstr(clientline,"/?power=off")!=0) {  //look for command to turn device off
+          httpCommand = "powerOff";
+        } else if(strstr(clientline,"/?volume=status")!=0) { // check current volume
+          httpCommand = "checkVolume";
+        } else if(strstr(clientline,"/?volume=")!=0) { // set the volume
+          httpCommand = "setVolume";
+          String clientlineStr = String(clientline);
+          int start = clientlineStr.indexOf("/?volume=");
+          String requestedVolumeStr = clientlineStr.substring(start+9, start+11);
+          requestedVolume = requestedVolumeStr.toInt();
+        } else {
+          httpCommand = "";
+        }
+      }
+    }
+
+    // handle commands
+    if(httpCommand == "powerOn") { 
+      setPower(true);
+      client.println(currentPowerStateInt());
+    } else if(httpCommand == "powerOff") { // turn off
+      setPower(false);
+      client.println(currentPowerStateInt());
+    } else if(httpCommand == "setVolume") {
+      int newVolume = setVolume(requestedVolume);
+      client.println(newVolume);
+    } else if(httpCommand == "checkVolume") {
+      client.println(currentVolume);
+    } else {
+      client.println(currentPowerStateInt());
+    }
+    httpCommand = "";
+    
+    delay(1);
+    client.stop();
+    Serial.println("client disconnected");
+  }
 }
 
