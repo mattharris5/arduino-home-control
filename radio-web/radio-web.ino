@@ -11,17 +11,18 @@
 #define powerTrigger 6
 #define minVolume 0
 #define maxVolume 40
+#define maxRequestVolume 30
 
 // Rotary encoder config
 Encoder volumeKnob(pinA_in, pinB_in);
 bool currentPowerState = false;
 int currentVolume = 0;
 long knobPosition  = -999;
+unsigned long lastVolumeResetTime;
+unsigned long volumeResetInterval = 5 * 60 * 1000; // reset volume every 5 minutes
 
 // Ethernet server config
-byte mac[] = {
-  0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xEE
-};
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xEE };
 IPAddress ip(10, 0, 1, 102);
 EthernetServer server(80);
 #define BUFSIZ 100  //Buffer size for getting data
@@ -68,7 +69,7 @@ void loop() {
 //
 // UTILITY FUNCTIONS
 //
-void adjustVolume(int direction) {  
+void adjustVolume(int direction) { 
   int leftPin = pinA_out;
   int rightPin = pinB_out;
 
@@ -96,7 +97,7 @@ void adjustVolume(int direction) {
   // Make sure we're not out of bounds
   if (currentVolume > maxVolume) {
     currentVolume = maxVolume;
-  } else if (currentVolume < minVolume) {
+  } else if (currentVolume < minVolume) { // - 20) { // allow less than zero to allow manual re-sync
     currentVolume = minVolume;
   }
   
@@ -138,8 +139,6 @@ void hijackVolumeKnob() {
   long newPosition;
   newPosition = volumeKnob.read();
   if (newPosition != knobPosition && newPosition != 0) {
-    // Serial.print("Position = ");
-    // Serial.println(newPosition);
     if (newPosition % 4 == 0) {
       adjustVolume(newPosition);
       volumeKnob.write(0);
@@ -161,19 +160,40 @@ int currentPowerStateInt() {
 }
 
 int setVolume(int newVolume) {
+  if (millis() > lastVolumeResetTime + volumeResetInterval) {
+    resetVolume();
+  }
   if (newVolume > maxVolume || newVolume < minVolume) {
     return currentVolume;
   }
   while(newVolume != currentVolume) {
     adjustVolume(newVolume - currentVolume);
+    delay(5);
   }
   return currentVolume;
 }
 
+int setVolumePercent(int newVolumePercent) {
+  int newVolume = (int) newVolumePercent * (maxRequestVolume / 100.0);
+  setVolume(newVolume);
+  Serial.print("Request was for ");
+  Serial.print(newVolumePercent);
+  Serial.print("%, setting actual volume to ");
+  Serial.println(newVolume);
+  return newVolumePercent;
+}
+
+int currentVolumePercent() {
+  return (int) currentVolume * (100.0 / maxRequestVolume);
+}
+
 void resetVolume() {
+  Serial.println("Resetting volume");
   for(int i = 40; i > 0; i--) {
     adjustVolume(-1);
+    delay(1);
   }
+  lastVolumeResetTime = millis();
 }
 
 void respondToEthernet() {
@@ -214,7 +234,7 @@ void respondToEthernet() {
           httpCommand = "setVolume";
           String clientlineStr = String(clientline);
           int start = clientlineStr.indexOf("/?volume=");
-          String requestedVolumeStr = clientlineStr.substring(start+9, start+11);
+          String requestedVolumeStr = clientlineStr.substring(start+9, start+12);
           requestedVolume = requestedVolumeStr.toInt();
         } else {
           httpCommand = "";
@@ -230,10 +250,10 @@ void respondToEthernet() {
       setPower(false);
       client.println(currentPowerStateInt());
     } else if(httpCommand == "setVolume") {
-      int newVolume = setVolume(requestedVolume);
+      int newVolume = setVolumePercent(requestedVolume);
       client.println(newVolume);
     } else if(httpCommand == "checkVolume") {
-      client.println(currentVolume);
+      client.println(currentVolumePercent());
     } else {
       client.println(currentPowerStateInt());
     }
